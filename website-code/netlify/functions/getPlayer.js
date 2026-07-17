@@ -25,26 +25,18 @@ exports.handler = async (event, context) => {
   let playerName;
   if (event.httpMethod === 'GET') {
     playerName = event.queryStringParameters?.name;
-  } else if (event.httpMethod === 'POST') {
+  } else {
     try {
       const body = JSON.parse(event.body || '{}');
       playerName = body.name;
-    } catch (e) { playerName = null; }
+    } catch(e) { playerName = null; }
   }
 
-  if (!playerName) {
+  if (!playerName || !/^[a-zA-Z0-9_]{3,16}$/.test(playerName)) {
     return {
       statusCode: 400,
       headers,
-      body: JSON.stringify({ error: true, message: 'Se requiere el parámetro "name"' }),
-    };
-  }
-
-  if (!/^[a-zA-Z0-9_]{3,16}$/.test(playerName)) {
-    return {
-      statusCode: 400,
-      headers,
-      body: JSON.stringify({ error: true, message: 'Nombre de usuario inválido' }),
+      body: JSON.stringify({ error: true, message: 'Nombre inválido' }),
     };
   }
 
@@ -52,7 +44,7 @@ exports.handler = async (event, context) => {
   try {
     connection = await mysql.createConnection(dbConfig);
 
-    // 1. Obtener jugador
+    // 1. Buscar jugador
     const [userRows] = await connection.execute(
       `SELECT id, uuid, name, registered FROM plan_users WHERE LOWER(name) = LOWER(?) LIMIT 1`,
       [playerName]
@@ -63,149 +55,92 @@ exports.handler = async (event, context) => {
       return {
         statusCode: 404,
         headers,
-        body: JSON.stringify({ error: true, message: 'Jugador no encontrado en el servidor' }),
+        body: JSON.stringify({ error: true, message: 'Jugador no encontrado' }),
       };
     }
 
     const user = userRows[0];
-    const playerUuid = user.uuid;
+    const uuid = user.uuid;
+    const userId = user.id;
 
-    // 2. Obtener TODOS los valores de extensiones del jugador
-    const [extRows] = await connection.execute(
-      `SELECT 
-        euv.string_value,
-        euv.double_value,
-        euv.long_value,
-        euv.group_value,
-        ep.provider_name,
-        ep.text,
-        epl.name as plugin_name
-       FROM plan_extension_user_values euv
-       JOIN plan_extension_providers ep ON ep.id = euv.provider_id
-       JOIN plan_extension_plugins epl ON epl.id = ep.plugin_id
-       WHERE euv.uuid = ?`,
-      [playerUuid]
-    );
-
-    // 3. Parsear valores buscando los placeholders del scoreboard
-    let rank = null;
-    let money = null;
-    let points = null;
-    let kills = 0;
-    let deaths = 0;
-    let daysPlayed = 0;
-    let hoursPlayed = 0;
-    let playtimeFormatted = null;
-
-    for (const row of extRows) {
-      const provName = (row.provider_name || '').toLowerCase();
-      const text    = (row.text || '').toLowerCase();
-      const plugin  = (row.plugin_name || '').toLowerCase();
-
-      // RANK - LuckPerms prefix/group
-      if (
-        plugin.includes('luckperms') ||
-        provName.includes('luckperms') ||
-        provName.includes('prefix') ||
-        provName.includes('luckperms_prefix')
-      ) {
-        if (row.string_value || row.group_value) {
-          rank = row.string_value || row.group_value;
-        }
-      }
-
-      // MONEY - Vault / Essentials balance
-      if (
-        plugin.includes('vault') ||
-        plugin.includes('essentials') ||
-        provName.includes('balance') ||
-        provName.includes('vault_eco') ||
-        provName.includes('money') ||
-        text.includes('balance') ||
-        text.includes('money')
-      ) {
-        if (row.double_value !== null && row.double_value !== undefined) {
-          money = row.double_value;
-        } else if (row.string_value) {
-          money = row.string_value;
-        }
-      }
-
-      // POINTS - PlayerPoints
-      if (
-        plugin.includes('playerpoints') ||
-        provName.includes('playerpoints') ||
-        provName.includes('points') ||
-        text.includes('points') ||
-        text.includes('puntos')
-      ) {
-        if (row.long_value !== null && row.long_value !== undefined) {
-          points = row.long_value;
-        } else if (row.double_value !== null && row.double_value !== undefined) {
-          points = row.double_value;
-        } else if (row.string_value) {
-          points = parseInt(row.string_value) || row.string_value;
-        }
-      }
-
-      // KILLS - statistic_player_kills
-      if (
-        provName.includes('player_kill') ||
-        provName.includes('playerkill') ||
-        text.includes('player kill') ||
-        text.includes('kills')
-      ) {
-        if (row.long_value !== null && row.long_value !== undefined) kills = row.long_value;
-        else if (row.double_value !== null) kills = row.double_value;
-      }
-
-      // DEATHS - statistic_deaths
-      if (
-        provName.includes('death') ||
-        text.includes('death') ||
-        text.includes('muerte')
-      ) {
-        if (row.long_value !== null && row.long_value !== undefined) deaths = row.long_value;
-        else if (row.double_value !== null) deaths = row.double_value;
-      }
-
-      // DAYS PLAYED - statistic_days_played
-      if (provName.includes('days_played') || text.includes('days played')) {
-        if (row.long_value !== null && row.long_value !== undefined) daysPlayed = row.long_value;
-        else if (row.double_value !== null) daysPlayed = row.double_value;
-      }
-
-      // HOURS PLAYED - statistic_hours_played
-      if (provName.includes('hours_played') || text.includes('hours played')) {
-        if (row.long_value !== null && row.long_value !== undefined) hoursPlayed = row.long_value;
-        else if (row.double_value !== null) hoursPlayed = row.double_value;
-      }
-    }
-
-    // 4. Calcular playtime total
-    // Primero intentamos con los placeholders de estadísticas
-    let finalHours = (daysPlayed * 24) + hoursPlayed;
-    let finalMinutes = 0;
-
-    // Si no hay datos de placeholders, usamos plan_sessions como respaldo
-    if (finalHours === 0) {
+    // 2. Playtime desde sessions
+    let finalHours = 0, finalMinutes = 0;
+    try {
       const [sessionRows] = await connection.execute(
         `SELECT COALESCE(SUM(session_end - session_start), 0) as total_ms
          FROM plan_sessions WHERE user_id = ?`,
-        [user.id]
+        [userId]
       );
-      const playtimeMs = parseInt(sessionRows[0]?.total_ms || 0);
-      finalHours   = Math.floor(playtimeMs / (1000 * 60 * 60));
-      finalMinutes = Math.floor((playtimeMs % (1000 * 60 * 60)) / (1000 * 60));
-    }
+      const ms = parseInt(sessionRows[0]?.total_ms || 0);
+      finalHours   = Math.floor(ms / (1000 * 60 * 60));
+      finalMinutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+    } catch(e) { console.log('sessions error:', e.message); }
 
-    playtimeFormatted = finalHours > 0
-      ? `${finalHours}h ${finalMinutes}m`
-      : `${finalMinutes}m`;
+    // 3. Obtener todos los providers disponibles (para debug)
+    let allProviders = [];
+    try {
+      const [provRows] = await connection.execute(
+        `SELECT ep.id, ep.provider_name, ep.text, ep.plugin_id
+         FROM plan_extension_providers ep`
+      );
+      allProviders = provRows;
+    } catch(e) { console.log('providers error:', e.message); }
+
+    // 4. Obtener todos los valores del jugador desde plan_extension_user_values
+    let allValues = [];
+    try {
+      const [valRows] = await connection.execute(
+        `SELECT provider_id, string_value, double_value, long_value, group_value
+         FROM plan_extension_user_values WHERE uuid = ?`,
+        [uuid]
+      );
+      allValues = valRows;
+    } catch(e) { console.log('user_values error:', e.message); }
+
+    // 5. Cruzar valores con providers
+    let rank = null, money = null, points = null, kills = 0, deaths = 0;
+
+    for (const val of allValues) {
+      const provider = allProviders.find(p => p.id === val.provider_id);
+      if (!provider) continue;
+
+      const provName = (provider.provider_name || '').toLowerCase();
+      const text     = (provider.text || '').toLowerCase();
+
+      // RANK
+      if (provName.includes('prefix') || provName.includes('group') || provName.includes('rank')) {
+        rank = val.string_value || val.group_value || rank;
+      }
+
+      // MONEY
+      if (provName.includes('balance') || provName.includes('money') || provName.includes('eco') ||
+          text.includes('balance') || text.includes('money')) {
+        money = val.double_value ?? val.string_value ?? money;
+      }
+
+      // POINTS
+      if (provName.includes('point') || text.includes('point')) {
+        points = val.long_value ?? val.double_value ?? parseInt(val.string_value) ?? points;
+      }
+
+      // KILLS
+      if (provName.includes('player_kill') || provName.includes('kills') ||
+          text.includes('kill')) {
+        kills = val.long_value ?? val.double_value ?? kills;
+      }
+
+      // DEATHS
+      if (provName.includes('death') || text.includes('death')) {
+        deaths = val.long_value ?? val.double_value ?? deaths;
+      }
+    }
 
     await connection.end();
 
     const kd = deaths > 0 ? (kills / deaths).toFixed(2) : kills.toString();
+    const playtimeFormatted = finalHours > 0
+      ? `${finalHours}h ${finalMinutes}m`
+      : `${finalMinutes}m`;
 
     return {
       statusCode: 200,
@@ -214,28 +149,31 @@ exports.handler = async (event, context) => {
         success: true,
         player: {
           name: user.name,
-          uuid: playerUuid,
-          registered: user.registered,
+          uuid: uuid,
           playtime: {
             hours: finalHours,
             minutes: finalMinutes,
             formatted: playtimeFormatted,
           },
-          deaths:  deaths,
-          kills:   kills,
-          kd:      kd,
-          rank:    rank,
-          money:   money,
-          points:  points,
-          headUrl:   `https://crafthead.net/helm/${playerUuid}/120`,
-          avatarUrl: `https://crafthead.net/avatar/${playerUuid}/64`,
-          _debug: {
-            totalExtRows: extRows.length,
-            providers: extRows.map(r =>
-              `[${r.plugin_name}] ${r.provider_name} | text: ${r.text} | str: ${r.string_value} | dbl: ${r.double_value} | lng: ${r.long_value} | grp: ${r.group_value}`
-            )
-          }
+          kills,
+          deaths,
+          kd,
+          rank,
+          money,
+          points,
+          headUrl:   `https://crafthead.net/helm/${uuid}/120`,
+          avatarUrl: `https://crafthead.net/avatar/${uuid}/64`,
         },
+        // DEBUG: muestra todos los providers y valores encontrados
+        _debug: {
+          totalProviders: allProviders.length,
+          totalValues: allValues.length,
+          providers: allProviders.map(p => `[${p.id}] ${p.provider_name} | ${p.text}`),
+          values: allValues.map(v => {
+            const p = allProviders.find(pr => pr.id === v.provider_id);
+            return `provider: ${p?.provider_name || v.provider_id} | str: ${v.string_value} | dbl: ${v.double_value} | lng: ${v.long_value} | grp: ${v.group_value}`;
+          })
+        }
       }),
     };
 
@@ -249,8 +187,9 @@ exports.handler = async (event, context) => {
         error: true,
         message: 'Error de base de datos',
         debug: {
-          code: error.code,
+          code: error.code || 'UNKNOWN',
           message: error.message,
+          sql: error.sql || null,
           sqlMessage: error.sqlMessage || null,
         }
       }),
