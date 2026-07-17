@@ -1,13 +1,18 @@
 const mysql = require('mysql2/promise');
 
 // Database configuration - Uses environment variables for security
+// Railway requires SSL connection
 const dbConfig = {
   host: process.env.MYSQL_HOST || 'tokaido.proxy.rlwy.net',
   port: parseInt(process.env.MYSQL_PORT || '46214'),
   user: process.env.MYSQL_USER || 'root',
-  password: process.env.MYSQL_PASSWORD, // Set this in Netlify environment variables!
+  password: process.env.MYSQL_PASSWORD,
   database: process.env.MYSQL_DATABASE || 'railway',
-  connectTimeout: 10000,
+  connectTimeout: 15000,
+  // Railway requires SSL
+  ssl: {
+    rejectUnauthorized: false
+  }
 };
 
 exports.handler = async (event, context) => {
@@ -64,7 +69,7 @@ exports.handler = async (event, context) => {
   let connection;
 
   try {
-    // Connect to MySQL
+    // Connect to MySQL with SSL
     connection = await mysql.createConnection(dbConfig);
 
     // 1. Get player UUID and basic info from plan_users
@@ -77,6 +82,7 @@ exports.handler = async (event, context) => {
     );
 
     if (userRows.length === 0) {
+      await connection.end();
       return {
         statusCode: 404,
         headers,
@@ -88,7 +94,7 @@ exports.handler = async (event, context) => {
     }
 
     const user = userRows[0];
-    const odljugador = user.uuid;
+    const playerUuid = user.uuid;
     const odljugadorId = user.id;
 
     // 2. Get total playtime from plan_sessions
@@ -100,7 +106,7 @@ exports.handler = async (event, context) => {
     );
     const playtimeMs = parseInt(playtimeRows[0]?.total_playtime || 0);
 
-    // 3. Get deaths - Try plan_users first, then plan_user_info
+    // 3. Get deaths - Try plan_user_info first
     let deaths = 0;
     try {
       const [deathRows] = await connection.execute(
@@ -111,7 +117,6 @@ exports.handler = async (event, context) => {
       );
       deaths = parseInt(deathRows[0]?.total_deaths || 0);
     } catch (e) {
-      // Table might not exist or have different structure
       console.log('Could not fetch deaths from plan_user_info:', e.message);
     }
 
@@ -122,7 +127,7 @@ exports.handler = async (event, context) => {
         `SELECT COUNT(*) as kill_count
          FROM plan_kills 
          WHERE killer_uuid = ?`,
-        [odljugador]
+        [playerUuid]
       );
       kills = parseInt(killRows[0]?.kill_count || 0);
     } catch (e) {
@@ -234,7 +239,7 @@ exports.handler = async (event, context) => {
         success: true,
         player: {
           name: user.name,
-          uuid: odljugador,
+          uuid: playerUuid,
           odljugadorDb: odljugadorId,
           registered: user.registered,
           playtime: {
@@ -249,8 +254,8 @@ exports.handler = async (event, context) => {
           rank: rank,
           money: money,
           points: points,
-          headUrl: `https://crafthead.net/helm/${odljugador}/120`,
-          avatarUrl: `https://crafthead.net/avatar/${odljugador}/64`,
+          headUrl: `https://crafthead.net/helm/${playerUuid}/120`,
+          avatarUrl: `https://crafthead.net/avatar/${playerUuid}/64`,
         },
       }),
     };
@@ -266,27 +271,31 @@ exports.handler = async (event, context) => {
       }
     }
 
-    // Determine error type
-    let errorMessage = 'Error al conectar con la base de datos';
-    let statusCode = 500;
-
-    if (error.code === 'ECONNREFUSED') {
-      errorMessage = 'No se pudo conectar al servidor de base de datos';
-    } else if (error.code === 'ER_ACCESS_DENIED_ERROR') {
-      errorMessage = 'Credenciales de base de datos inválidas';
-    } else if (error.code === 'ETIMEDOUT') {
-      errorMessage = 'Tiempo de conexión agotado';
-    } else if (error.code === 'ER_NO_SUCH_TABLE') {
-      errorMessage = 'Tabla no encontrada - Verifica que Plan esté guardando datos';
-    }
-
+    // Return the REAL error for debugging
     return {
-      statusCode,
+      statusCode: 500,
       headers,
       body: JSON.stringify({ 
         error: true, 
-        message: errorMessage,
-        details: process.env.NODE_ENV === 'development' ? error.message : undefined,
+        message: 'Error de base de datos',
+        // Show real error details for debugging
+        debug: {
+          code: error.code || 'UNKNOWN',
+          errno: error.errno || null,
+          sqlState: error.sqlState || null,
+          sqlMessage: error.sqlMessage || error.message,
+          fullError: error.toString(),
+        },
+        // Also show connection config (without password) for verification
+        connectionInfo: {
+          host: dbConfig.host,
+          port: dbConfig.port,
+          user: dbConfig.user,
+          database: dbConfig.database,
+          hasPassword: !!dbConfig.password,
+          passwordLength: dbConfig.password ? dbConfig.password.length : 0,
+          ssl: 'enabled (rejectUnauthorized: false)',
+        }
       }),
     };
   }
