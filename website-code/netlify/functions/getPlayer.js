@@ -98,130 +98,256 @@ exports.handler = async (event, context) => {
     const odljugadorId = user.id;
 
     // 2. Get total playtime from plan_sessions
-    const [playtimeRows] = await connection.execute(
-      `SELECT COALESCE(SUM(session_end - session_start), 0) as total_playtime
-       FROM plan_sessions 
-       WHERE user_id = ?`,
-      [odljugadorId]
-    );
-    const playtimeMs = parseInt(playtimeRows[0]?.total_playtime || 0);
-
-    // 3. Get deaths - Try plan_user_info first
-    let deaths = 0;
+    let playtimeMs = 0;
     try {
-      const [deathRows] = await connection.execute(
-        `SELECT COALESCE(SUM(deaths), 0) as total_deaths
+      const [playtimeRows] = await connection.execute(
+        `SELECT COALESCE(SUM(session_end - session_start), 0) as total_playtime
+         FROM plan_sessions 
+         WHERE user_id = ?`,
+        [odljugadorId]
+      );
+      playtimeMs = parseInt(playtimeRows[0]?.total_playtime || 0);
+    } catch (e) {
+      console.log('Could not fetch playtime:', e.message);
+    }
+
+    // 3. Get kills and deaths from plan_user_info (primary source)
+    let deaths = 0;
+    let playerKills = 0;
+    let mobKills = 0;
+    
+    try {
+      const [userInfoRows] = await connection.execute(
+        `SELECT 
+          COALESCE(SUM(deaths), 0) as total_deaths,
+          COALESCE(SUM(death_count), 0) as death_count,
+          COALESCE(SUM(mob_kill_count), 0) as mob_kills,
+          COALESCE(SUM(player_kill_count), 0) as player_kills
          FROM plan_user_info 
          WHERE user_id = ?`,
         [odljugadorId]
       );
-      deaths = parseInt(deathRows[0]?.total_deaths || 0);
-    } catch (e) {
-      console.log('Could not fetch deaths from plan_user_info:', e.message);
-    }
-
-    // 4. Get kills from plan_kills
-    let kills = 0;
-    try {
-      const [killRows] = await connection.execute(
-        `SELECT COUNT(*) as kill_count
-         FROM plan_kills 
-         WHERE killer_uuid = ?`,
-        [playerUuid]
-      );
-      kills = parseInt(killRows[0]?.kill_count || 0);
-    } catch (e) {
-      console.log('Could not fetch kills:', e.message);
-    }
-
-    // 5. Get LuckPerms rank from plan_extension_player_values
-    let rank = null;
-    try {
-      // First get the provider ID for LuckPerms
-      const [providerRows] = await connection.execute(
-        `SELECT id FROM plan_extension_providers 
-         WHERE provider_name = 'LuckPerms' OR plugin_name = 'LuckPerms'
-         LIMIT 1`
-      );
       
-      if (providerRows.length > 0) {
-        const [rankRows] = await connection.execute(
-          `SELECT string_value, group_value
-           FROM plan_extension_player_values 
-           WHERE user_id = ? AND provider_id = ?
-           LIMIT 1`,
-          [odljugadorId, providerRows[0].id]
+      if (userInfoRows.length > 0) {
+        const info = userInfoRows[0];
+        deaths = parseInt(info.total_deaths || info.death_count || 0);
+        mobKills = parseInt(info.mob_kills || 0);
+        playerKills = parseInt(info.player_kills || 0);
+      }
+    } catch (e) {
+      console.log('Could not fetch from plan_user_info:', e.message);
+      
+      // Fallback: try alternative column names
+      try {
+        const [altRows] = await connection.execute(
+          `SELECT 
+            COALESCE(SUM(deathCount), 0) as deaths,
+            COALESCE(SUM(mobKillCount), 0) as mob_kills,
+            COALESCE(SUM(playerKillCount), 0) as player_kills
+           FROM plan_user_info 
+           WHERE user_id = ?`,
+          [odljugadorId]
         );
         
-        if (rankRows.length > 0) {
-          rank = rankRows[0].string_value || rankRows[0].group_value;
+        if (altRows.length > 0) {
+          deaths = parseInt(altRows[0].deaths || 0);
+          mobKills = parseInt(altRows[0].mob_kills || 0);
+          playerKills = parseInt(altRows[0].player_kills || 0);
+        }
+      } catch (e2) {
+        console.log('Alternative column names also failed:', e2.message);
+      }
+    }
+
+    // 4. Fallback: Get kills from plan_kills table if plan_user_info didn't have player kills
+    if (playerKills === 0) {
+      try {
+        const [killRows] = await connection.execute(
+          `SELECT COUNT(*) as kill_count
+           FROM plan_kills 
+           WHERE killer_uuid = ?`,
+          [playerUuid]
+        );
+        playerKills = parseInt(killRows[0]?.kill_count || 0);
+      } catch (e) {
+        console.log('Could not fetch kills from plan_kills:', e.message);
+      }
+    }
+
+    // Total kills (player + mob)
+    const totalKills = playerKills + mobKills;
+
+    // 5. Get ALL extension data for this player with correct JOIN structure
+    // plan_extension_plugins -> plan_extension_providers -> plan_extension_player_values
+    let rank = null;
+    let money = null;
+    let points = null;
+    
+    try {
+      const [extensionRows] = await connection.execute(
+        `SELECT 
+          epv.string_value, 
+          epv.double_value, 
+          epv.long_value,
+          ep.provider_name, 
+          ep.text,
+          epl.name as plugin_name
+         FROM plan_extension_player_values epv
+         JOIN plan_extension_providers ep ON epv.provider_id = ep.id
+         JOIN plan_extension_plugins epl ON ep.plugin_id = epl.id
+         WHERE epv.user_id = ?
+         AND epl.name IN ('LuckPerms', 'Essentials', 'PlayerPoints', 'Vault', 'EssentialsX')`,
+        [odljugadorId]
+      );
+      
+      // Process each extension value
+      for (const row of extensionRows) {
+        const pluginName = row.plugin_name?.toLowerCase() || '';
+        const providerName = row.provider_name?.toLowerCase() || '';
+        const text = row.text?.toLowerCase() || '';
+        
+        // LuckPerms - Rank/Group
+        if (pluginName === 'luckperms' || pluginName.includes('luckperms')) {
+          if (providerName.includes('group') || providerName.includes('rank') || 
+              text.includes('group') || text.includes('rank') || text.includes('primary')) {
+            if (row.string_value && !rank) {
+              rank = row.string_value;
+            }
+          }
+        }
+        
+        // Essentials/Vault - Money/Balance
+        if (pluginName === 'essentials' || pluginName === 'essentialsx' || 
+            pluginName === 'vault' || pluginName.includes('economy')) {
+          if (providerName.includes('balance') || providerName.includes('money') || 
+              text.includes('balance') || text.includes('money') || text.includes('dinero')) {
+            if (row.double_value !== null && money === null) {
+              money = row.double_value;
+            } else if (row.string_value && money === null) {
+              money = parseFloat(row.string_value) || null;
+            }
+          }
+        }
+        
+        // PlayerPoints - Points
+        if (pluginName === 'playerpoints' || pluginName.includes('points')) {
+          if (row.long_value !== null && points === null) {
+            points = parseInt(row.long_value);
+          } else if (row.double_value !== null && points === null) {
+            points = parseInt(row.double_value);
+          } else if (row.string_value && points === null) {
+            points = parseInt(row.string_value) || null;
+          }
         }
       }
       
-      // Alternative: Try to find any LuckPerms related data
-      if (!rank) {
-        const [altRankRows] = await connection.execute(
-          `SELECT epv.string_value, epv.group_value, ep.text 
+      // Debug: Log what we found
+      console.log(`Found ${extensionRows.length} extension rows for player ${playerName}`);
+      console.log('Extension data:', JSON.stringify(extensionRows.slice(0, 5))); // Log first 5
+      
+    } catch (e) {
+      console.log('Could not fetch extension data:', e.message);
+    }
+
+    // 6. If we still don't have rank, try a broader search
+    if (!rank) {
+      try {
+        const [rankRows] = await connection.execute(
+          `SELECT 
+            epv.string_value, 
+            ep.provider_name, 
+            ep.text,
+            epl.name as plugin_name
            FROM plan_extension_player_values epv
            JOIN plan_extension_providers ep ON epv.provider_id = ep.id
-           WHERE epv.user_id = ? 
-           AND (ep.provider_name LIKE '%LuckPerms%' OR ep.plugin_name LIKE '%LuckPerms%' OR ep.text LIKE '%rank%' OR ep.text LIKE '%group%')
+           JOIN plan_extension_plugins epl ON ep.plugin_id = epl.id
+           WHERE epv.user_id = ?
+           AND epv.string_value IS NOT NULL
+           AND epv.string_value != ''
+           AND (
+             ep.text LIKE '%rank%' OR 
+             ep.text LIKE '%group%' OR 
+             ep.text LIKE '%prefix%' OR
+             ep.provider_name LIKE '%rank%' OR 
+             ep.provider_name LIKE '%group%'
+           )
            LIMIT 1`,
           [odljugadorId]
         );
         
-        if (altRankRows.length > 0) {
-          rank = altRankRows[0].string_value || altRankRows[0].group_value;
+        if (rankRows.length > 0 && rankRows[0].string_value) {
+          rank = rankRows[0].string_value;
         }
+      } catch (e) {
+        console.log('Broader rank search failed:', e.message);
       }
-    } catch (e) {
-      console.log('Could not fetch rank:', e.message);
     }
 
-    // 6. Get money from Essentials/Vault
-    let money = null;
-    try {
-      const [moneyRows] = await connection.execute(
-        `SELECT epv.double_value, epv.string_value, ep.provider_name, ep.text
-         FROM plan_extension_player_values epv
-         JOIN plan_extension_providers ep ON epv.provider_id = ep.id
-         WHERE epv.user_id = ? 
-         AND (ep.provider_name IN ('Essentials', 'Vault', 'Economy') 
-              OR ep.text LIKE '%balance%' 
-              OR ep.text LIKE '%money%'
-              OR ep.text LIKE '%dinero%')
-         LIMIT 1`,
-        [odljugadorId]
-      );
-      
-      if (moneyRows.length > 0) {
-        money = moneyRows[0].double_value || parseFloat(moneyRows[0].string_value) || null;
+    // 7. If we still don't have money, try a broader search
+    if (money === null) {
+      try {
+        const [moneyRows] = await connection.execute(
+          `SELECT 
+            epv.double_value,
+            epv.string_value,
+            ep.provider_name, 
+            ep.text,
+            epl.name as plugin_name
+           FROM plan_extension_player_values epv
+           JOIN plan_extension_providers ep ON epv.provider_id = ep.id
+           JOIN plan_extension_plugins epl ON ep.plugin_id = epl.id
+           WHERE epv.user_id = ?
+           AND (epv.double_value IS NOT NULL OR epv.string_value REGEXP '^[0-9]')
+           AND (
+             ep.text LIKE '%balance%' OR 
+             ep.text LIKE '%money%' OR 
+             ep.text LIKE '%dinero%' OR
+             ep.provider_name LIKE '%balance%' OR 
+             ep.provider_name LIKE '%money%'
+           )
+           LIMIT 1`,
+          [odljugadorId]
+        );
+        
+        if (moneyRows.length > 0) {
+          money = moneyRows[0].double_value || parseFloat(moneyRows[0].string_value) || null;
+        }
+      } catch (e) {
+        console.log('Broader money search failed:', e.message);
       }
-    } catch (e) {
-      console.log('Could not fetch money:', e.message);
     }
 
-    // 7. Try to get PlayerPoints
-    let points = null;
-    try {
-      const [pointsRows] = await connection.execute(
-        `SELECT epv.long_value, epv.double_value, epv.string_value
-         FROM plan_extension_player_values epv
-         JOIN plan_extension_providers ep ON epv.provider_id = ep.id
-         WHERE epv.user_id = ? 
-         AND (ep.provider_name = 'PlayerPoints' 
-              OR ep.plugin_name = 'PlayerPoints'
-              OR ep.text LIKE '%points%'
-              OR ep.text LIKE '%puntos%')
-         LIMIT 1`,
-        [odljugadorId]
-      );
-      
-      if (pointsRows.length > 0) {
-        points = pointsRows[0].long_value || pointsRows[0].double_value || parseInt(pointsRows[0].string_value) || null;
+    // 8. If we still don't have points, try a broader search
+    if (points === null) {
+      try {
+        const [pointsRows] = await connection.execute(
+          `SELECT 
+            epv.long_value,
+            epv.double_value,
+            epv.string_value,
+            ep.provider_name, 
+            ep.text,
+            epl.name as plugin_name
+           FROM plan_extension_player_values epv
+           JOIN plan_extension_providers ep ON epv.provider_id = ep.id
+           JOIN plan_extension_plugins epl ON ep.plugin_id = epl.id
+           WHERE epv.user_id = ?
+           AND (epv.long_value IS NOT NULL OR epv.double_value IS NOT NULL)
+           AND (
+             ep.text LIKE '%point%' OR 
+             ep.text LIKE '%punto%' OR
+             ep.provider_name LIKE '%point%'
+           )
+           LIMIT 1`,
+          [odljugadorId]
+        );
+        
+        if (pointsRows.length > 0) {
+          points = parseInt(pointsRows[0].long_value || pointsRows[0].double_value) || null;
+        }
+      } catch (e) {
+        console.log('Broader points search failed:', e.message);
       }
-    } catch (e) {
-      console.log('Could not fetch points:', e.message);
     }
 
     // Close connection
@@ -249,8 +375,10 @@ exports.handler = async (event, context) => {
             formatted: hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`,
           },
           deaths: deaths,
-          kills: kills,
-          kd: deaths > 0 ? (kills / deaths).toFixed(2) : kills.toString(),
+          kills: totalKills,
+          playerKills: playerKills,
+          mobKills: mobKills,
+          kd: deaths > 0 ? (totalKills / deaths).toFixed(2) : totalKills.toString(),
           rank: rank,
           money: money,
           points: points,
@@ -278,7 +406,6 @@ exports.handler = async (event, context) => {
       body: JSON.stringify({ 
         error: true, 
         message: 'Error de base de datos',
-        // Show real error details for debugging
         debug: {
           code: error.code || 'UNKNOWN',
           errno: error.errno || null,
@@ -286,7 +413,6 @@ exports.handler = async (event, context) => {
           sqlMessage: error.sqlMessage || error.message,
           fullError: error.toString(),
         },
-        // Also show connection config (without password) for verification
         connectionInfo: {
           host: dbConfig.host,
           port: dbConfig.port,
