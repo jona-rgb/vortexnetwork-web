@@ -10,6 +10,31 @@ const dbConfig = {
   ssl: { rejectUnauthorized: false }
 };
 
+// Limpia códigos de color de Minecraft (&6&l etc)
+function cleanMinecraftColors(str) {
+  if (!str) return str;
+  return str
+    .replace(/&[0-9a-fklmnorA-FKLMNOR]/g, '')
+    .replace(/§[0-9a-fklmnorA-FKLMNOR]/g, '')
+    .trim();
+}
+
+// Obtiene el mejor valor numérico o string de una fila
+function getValue(val) {
+  if (val.long_value !== null && val.long_value !== undefined) return val.long_value;
+  if (val.double_value !== null && val.double_value !== undefined) return val.double_value;
+  if (val.string_value !== null && val.string_value !== undefined) return val.string_value;
+  if (val.group_value !== null && val.group_value !== undefined) return val.group_value;
+  return null;
+}
+
+// Convierte cualquier valor a número
+function toNumber(val) {
+  if (val === null || val === undefined) return 0;
+  const n = parseFloat(val);
+  return isNaN(n) ? 0 : n;
+}
+
 exports.handler = async (event, context) => {
   const headers = {
     'Access-Control-Allow-Origin': '*',
@@ -63,21 +88,7 @@ exports.handler = async (event, context) => {
     const uuid = user.uuid;
     const userId = user.id;
 
-    // 2. Playtime desde sessions
-    let finalHours = 0, finalMinutes = 0;
-    try {
-      const [sessionRows] = await connection.execute(
-        `SELECT COALESCE(SUM(session_end - session_start), 0) as total_ms
-         FROM plan_sessions WHERE user_id = ?`,
-        [userId]
-      );
-      const ms = parseInt(sessionRows[0]?.total_ms || 0);
-      finalHours   = Math.floor(ms / (1000 * 60 * 60));
-      finalMinutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
-    } catch(e) { console.log('sessions error:', e.message); }
-
-    // 3. Obtener columnas reales de plan_extension_providers
-    // La columna correcta es "name" NO "provider_name"
+    // 2. Obtener providers
     let allProviders = [];
     try {
       const [provRows] = await connection.execute(
@@ -86,7 +97,7 @@ exports.handler = async (event, context) => {
       allProviders = provRows;
     } catch(e) { console.log('providers error:', e.message); }
 
-    // 4. Obtener plugins para saber a qué plugin pertenece cada provider
+    // 3. Obtener plugins
     let allPlugins = [];
     try {
       const [plugRows] = await connection.execute(
@@ -95,7 +106,7 @@ exports.handler = async (event, context) => {
       allPlugins = plugRows;
     } catch(e) { console.log('plugins error:', e.message); }
 
-    // 5. Obtener valores del jugador
+    // 4. Obtener valores del jugador
     let allValues = [];
     try {
       const [valRows] = await connection.execute(
@@ -106,8 +117,14 @@ exports.handler = async (event, context) => {
       allValues = valRows;
     } catch(e) { console.log('user_values error:', e.message); }
 
-    // 6. Cruzar valores con providers y plugins
-    let rank = null, money = null, points = null, kills = 0, deaths = 0;
+    // 5. Parsear valores
+    let rank = null;
+    let money = null;
+    let points = null;
+    let kills = 0;
+    let deaths = 0;
+    let hoursPlayed = 0;
+    let daysPlayed = 0;
 
     for (const val of allValues) {
       const provider = allProviders.find(p => p.id === val.provider_id);
@@ -115,54 +132,79 @@ exports.handler = async (event, context) => {
 
       const plugin   = allPlugins.find(pl => pl.id === provider.plugin_id);
       const provName = (provider.name || '').toLowerCase();
-      const text     = (provider.text || '').toLowerCase();
       const plugName = (plugin?.name || '').toLowerCase();
+      const rawValue = getValue(val);
 
-      // RANK - LuckPerms
-      if (plugName.includes('luckperms') || provName.includes('prefix') ||
-          provName.includes('group') || provName.includes('rank')) {
-        if (val.string_value || val.group_value) {
-          rank = val.string_value || val.group_value;
-        }
+      // ── RANK (usar luckperms_prefix de PlaceholderAPI, es el más limpio) ──
+      if (provName === 'luckperms_prefix') {
+        rank = cleanMinecraftColors(val.string_value);
+      }
+      // Fallback: prefix directo de LuckPerms
+      if (!rank && plugName.includes('luckperms') && provName === 'prefix') {
+        rank = cleanMinecraftColors(val.string_value || val.group_value);
       }
 
-      // MONEY - Vault / Essentials
-      if (plugName.includes('vault') || plugName.includes('essentials') ||
-          provName.includes('balance') || provName.includes('money') ||
-          provName.includes('eco') || text.includes('balance') ||
-          text.includes('money') || text.includes('dinero')) {
-        if (val.double_value !== null && val.double_value !== undefined) {
-          money = val.double_value;
-        } else if (val.string_value) {
-          money = val.string_value;
-        }
+      // ── MONEY (usar vault_eco_balance_formatted, ya viene formateado "8.1k") ──
+      if (provName === 'vault_eco_balance_formatted') {
+        money = val.string_value;
+      }
+      // Fallback: balance numérico
+      if (!money && (provName === 'balance') && val.double_value !== null) {
+        money = val.double_value;
       }
 
-      // POINTS - PlayerPoints
-      if (plugName.includes('playerpoints') || provName.includes('point') ||
-          text.includes('point') || text.includes('punto')) {
-        points = val.long_value ?? val.double_value ?? parseInt(val.string_value) ?? points;
+      // ── POINTS (playerpoints_points) ──
+      if (provName === 'playerpoints_points') {
+        points = toNumber(rawValue);
       }
 
-      // KILLS
-      if (provName.includes('kill') || text.includes('kill') ||
-          text.includes('mata')) {
-        kills = val.long_value ?? val.double_value ?? kills;
+      // ── KILLS (statistic_player_kills) ──
+      if (provName === 'statistic_player_kills') {
+        kills = toNumber(rawValue);
       }
 
-      // DEATHS
-      if (provName.includes('death') || text.includes('death') ||
-          text.includes('muerte')) {
-        deaths = val.long_value ?? val.double_value ?? deaths;
+      // ── DEATHS (statistic_deaths) ──
+      if (provName === 'statistic_deaths') {
+        deaths = toNumber(rawValue);
       }
+
+      // ── HOURS PLAYED (statistic_hours_played) ──
+      if (provName === 'statistic_hours_played') {
+        hoursPlayed = toNumber(rawValue);
+      }
+
+      // ── DAYS PLAYED (statistic_days_played) ──
+      if (provName === 'statistic_days_played') {
+        daysPlayed = toNumber(rawValue);
+      }
+    }
+
+    // 6. Calcular playtime total
+    let finalHours = (daysPlayed * 24) + hoursPlayed;
+    let finalMinutes = 0;
+
+    // Si statistic no tiene datos, usar plan_sessions como respaldo
+    if (finalHours === 0) {
+      try {
+        const [sessionRows] = await connection.execute(
+          `SELECT COALESCE(SUM(session_end - session_start), 0) as total_ms
+           FROM plan_sessions WHERE user_id = ?`,
+          [userId]
+        );
+        const ms = parseInt(sessionRows[0]?.total_ms || 0);
+        finalHours   = Math.floor(ms / (1000 * 60 * 60));
+        finalMinutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
+      } catch(e) { console.log('sessions error:', e.message); }
     }
 
     await connection.end();
 
     const kd = deaths > 0 ? (kills / deaths).toFixed(2) : kills.toString();
-    const playtimeFormatted = finalHours > 0
-      ? `${finalHours}h ${finalMinutes}m`
-      : `${finalMinutes}m`;
+    const playtimeFormatted = daysPlayed > 0
+      ? `${daysPlayed}d ${hoursPlayed}h`
+      : finalHours > 0
+        ? `${finalHours}h ${finalMinutes}m`
+        : `${finalMinutes}m`;
 
     return {
       statusCode: 200,
@@ -173,6 +215,7 @@ exports.handler = async (event, context) => {
           name: user.name,
           uuid: uuid,
           playtime: {
+            days: daysPlayed,
             hours: finalHours,
             minutes: finalMinutes,
             formatted: playtimeFormatted,
@@ -185,18 +228,6 @@ exports.handler = async (event, context) => {
           points,
           headUrl:   `https://crafthead.net/helm/${uuid}/120`,
           avatarUrl: `https://crafthead.net/avatar/${uuid}/64`,
-        },
-        _debug: {
-          totalProviders: allProviders.length,
-          totalValues: allValues.length,
-          allProviders: allProviders.map(p => {
-            const pl = allPlugins.find(pl => pl.id === p.plugin_id);
-            return `[plugin: ${pl?.name}] provider: ${p.name} | text: ${p.text}`;
-          }),
-          allValues: allValues.map(v => {
-            const p = allProviders.find(pr => pr.id === v.provider_id);
-            return `provider: ${p?.name} | str: ${v.string_value} | dbl: ${v.double_value} | lng: ${v.long_value} | grp: ${v.group_value}`;
-          })
         }
       }),
     };
@@ -213,7 +244,6 @@ exports.handler = async (event, context) => {
         debug: {
           code: error.code || 'UNKNOWN',
           message: error.message,
-          sql: error.sql || null,
           sqlMessage: error.sqlMessage || null,
         }
       }),
